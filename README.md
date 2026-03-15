@@ -13,7 +13,7 @@
 
 <p align="center">
   AI-powered multi-zone HVAC control for Home Assistant.<br/>
-  Part of the Smart Operations for Power and Home using Intelligence and Automation ecosystem.
+  Part of the S.O.P.H.I.A. ecosystem.
 </p>
 
 ---
