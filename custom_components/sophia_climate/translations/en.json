@@ -1,0 +1,102 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "SOPHIA Climate Setup",
+        "description": "{info}",
+        "data": {
+          "check_interval": "Check Interval",
+          "outdoor_temp_sensor": "Outdoor Temperature Sensor"
+        }
+      },
+      "add_zone": {
+        "title": "Add Climate Zone",
+        "description": "{info}",
+        "data": {
+          "add_zone": "Add a zone"
+        }
+      },
+      "configure_zone": {
+        "title": "Configure Zone",
+        "description": "{info}",
+        "data": {
+          "zone_name": "Zone Name",
+          "thermostat_entity": "Thermostat (optional)",
+          "temp_sensor_entity": "Temperature Sensor (optional)",
+          "zone_priority": "Zone Priority"
+        }
+      },
+      "seasonal_temps": {
+        "title": "Seasonal Temperatures",
+        "description": "{info}",
+        "data": {
+          "winter_target": "Winter Target Temperature",
+          "winter_sleep": "Winter Sleep Temperature",
+          "spring_target": "Spring Target Temperature",
+          "summer_target": "Summer Target Temperature",
+          "summer_sleep": "Summer Sleep Temperature",
+          "fall_target": "Fall Target Temperature"
+        }
+      },
+      "special_instructions": {
+        "title": "Special Instructions & Preferences",
+        "description": "{info}",
+        "data": {
+          "special_instructions": "Custom Instructions for AI",
+          "energy_priority": "Energy Priority",
+          "aggressive_optimization": "Enable Aggressive Optimization"
+        }
+      }
+    },
+    "error": {
+      "sophia_core_not_found": "SOPHIA Core integration not found. Please install and configure SOPHIA Core first.",
+      "no_zones_configured": "You must add at least one climate zone to continue.",
+      "no_entities_selected": "Please select at least a thermostat OR temperature sensor for this zone.",
+      "zone_name_exists": "A zone with this name already exists. Please use a different name.",
+      "zone_name_empty": "Zone name cannot be empty. Please provide a name for this zone."
+    },
+    "abort": {
+      "already_configured": "SOPHIA Climate is already configured.",
+      "use_reconfigure": "To manage zones, please use the Reconfigure option from the integration page."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "SOPHIA Climate Options",
+        "description": "{info}",
+        "data": {
+          "action": "What would you like to update?"
+        }
+      },
+      "update_interval": {
+        "title": "Update Check Interval",
+        "description": "Adjust how often SOPHIA checks and optimizes your climate",
+        "data": {
+          "check_interval": "Check Interval"
+        }
+      },
+      "update_seasonal": {
+        "title": "Update Seasonal Temperatures",
+        "description": "Adjust target temperatures for each season",
+        "data": {
+          "winter_target": "Winter Target Temperature",
+          "winter_sleep": "Winter Sleep Temperature",
+          "spring_target": "Spring Target Temperature",
+          "summer_target": "Summer Target Temperature",
+          "summer_sleep": "Summer Sleep Temperature",
+          "fall_target": "Fall Target Temperature"
+        }
+      },
+      "update_instructions": {
+        "title": "Update Special Instructions",
+        "description": "Update AI instructions and energy preferences",
+        "data": {
+          "special_instructions": "Custom Instructions for AI",
+          "energy_priority": "Energy Priority",
+          "aggressive_optimization": "Enable Aggressive Optimization"
+        }
+      }
+    }
+  }
+}

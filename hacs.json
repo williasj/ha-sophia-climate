@@ -1,0 +1,7 @@
+{
+  "name": "SOPHIA Climate",
+  "description": "AI-powered multi-zone HVAC control with seasonal optimization and energy efficiency scoring",
+  "render_readme": true,
+  "homeassistant": "2024.4.0",
+  "iot_class": "local_polling"
+}

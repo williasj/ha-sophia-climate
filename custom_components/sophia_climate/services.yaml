@@ -1,0 +1,82 @@
+# Services for SOPHIA Climate
+
+run_climate_check:
+  name: Run Climate Check
+  description: Manually trigger a climate decision check for all zones
+  fields: {}
+
+set_zone_target:
+  name: Set Zone Target Temperature
+  description: Set the target temperature for a specific zone
+  fields:
+    zone_id:
+      name: Zone ID
+      description: The zone identifier (e.g., "downstairs")
+      required: true
+      example: "downstairs"
+      selector:
+        text:
+    temperature:
+      name: Target Temperature
+      description: Desired temperature in Fahrenheit
+      required: true
+      example: 72
+      selector:
+        number:
+          min: 60
+          max: 85
+          step: 1
+          unit_of_measurement: "F"
+
+enable_zone:
+  name: Enable Zone
+  description: Enable climate control for a specific zone
+  fields:
+    zone_id:
+      name: Zone ID
+      description: The zone identifier (e.g., "downstairs")
+      required: true
+      example: "downstairs"
+      selector:
+        text:
+
+disable_zone:
+  name: Disable Zone
+  description: Disable climate control for a specific zone
+  fields:
+    zone_id:
+      name: Zone ID
+      description: The zone identifier (e.g., "downstairs")
+      required: true
+      example: "downstairs"
+      selector:
+        text:
+
+cleanup_history:
+  name: Cleanup Old History
+  description: Remove climate decision history older than specified days
+  fields:
+    days:
+      name: Days
+      description: Remove history older than this many days
+      required: false
+      default: 30
+      example: 30
+      selector:
+        number:
+          min: 1
+          max: 365
+          step: 1
+          unit_of_measurement: "days"
+
+export_history:
+  name: Export History to CSV
+  description: Export climate decision history to CSV file for analysis
+  fields:
+    filepath:
+      name: File Path
+      description: Path to output CSV file (e.g., /config/sophia_climate_history.csv)
+      required: true
+      example: "/config/sophia_climate_history.csv"
+      selector:
+        text:
