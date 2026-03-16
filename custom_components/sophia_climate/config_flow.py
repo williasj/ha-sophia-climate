@@ -6,6 +6,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import selector
 
 from .const import DOMAIN
 
@@ -73,10 +74,14 @@ class SophiaClimateConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data_schema = vol.Schema(
             {
                 vol.Required("zone_name", default="Main Zone"): str,
-                vol.Required("thermostat_entity"): str,
+                vol.Required("thermostat_entity"): selector.selector(
+                    {"entity": {"domain": "climate"}}
+                ),
                 vol.Required(
                     "outdoor_temp_sensor", default="sensor.outdoor_temperature"
-                ): str,
+                ): selector.selector(
+                    {"entity": {"domain": "sensor", "device_class": "temperature"}}
+                ),
             }
         )
 
@@ -357,13 +362,19 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
             {
                 vol.Required(
                     "outdoor_temp_sensor", default=current_temp_sensor
-                ): str,
+                ): selector.selector(
+                    {"entity": {"domain": "sensor", "device_class": "temperature"}}
+                ),
                 vol.Optional(
                     "outdoor_humidity_sensor", default=current_humidity_sensor
-                ): str,
+                ): selector.selector(
+                    {"entity": {"domain": "sensor", "device_class": "humidity"}}
+                ),
                 vol.Required(
                     "passive_humidity_limit", default=current_humidity_limit
-                ): vol.All(vol.Coerce(int), vol.Range(min=30, max=90)),
+                ): selector.selector(
+                    {"number": {"min": 30, "max": 90, "step": 1, "unit_of_measurement": "%"}}
+                ),
             }
         )
 
