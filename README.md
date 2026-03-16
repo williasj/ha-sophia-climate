@@ -13,7 +13,7 @@
 
 <p align="center">
   AI-powered multi-zone HVAC control for Home Assistant.<br/>
-  Part of the <strong>SOPHIA</strong> (Self-Optimizing Personal Home Intelligence Architecture) ecosystem.
+  Part of the S.O.P.H.I.A. ecosystem.
 </p>
 
 ---
