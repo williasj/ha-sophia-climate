@@ -167,11 +167,11 @@ Decisions are stored in `config/custom_components/sophia_climate/climate_decisio
 ## SOPHIA Ecosystem
 
 | Module | Repository | Status |
-|---|---|---|
+|--------|------------|--------|
 | SOPHIA Core | [ha-sophia-core](https://github.com/williasj/ha-sophia-core) | Released |
 | SOPHIA Climate | [ha-sophia-climate](https://github.com/williasj/ha-sophia-climate) | Released |
-| SOPHIA Systems | ha-sophia-systems | Coming soon |
-| SOPHIA Presence | ha-sophia-presence | Coming soon |
+| SOPHIA Systems | [ha-sophia-systems](https://github.com/williasj/ha-sophia-systems) | Released |
+| SOPHIA Presence | ha-sophia-presence | Coming Soon |
 
 ---
 
