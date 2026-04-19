@@ -121,11 +121,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     registry = core_data["registry"]
     llm_client = core_data["llm_client"]
     
-    # Determine whether sophia_core exposes a RAG backend (Qdrant URL configured).
-    # Scoped integrations NEVER read qdrant_url directly - they only ask core
-    # whether RAG is available and then use its public rag_* API.
-    core_config = core_data.get("config", {})
-    core_has_rag = bool(core_config.get("qdrant_url"))
+    # Ask sophia_core whether a RAG backend is available. Scoped integrations
+    # never probe Qdrant or TEI config directly - they use core's public API.
+    try:
+        core_has_rag = bool(llm_client.has_rag_backend())
+    except AttributeError:
+        # Older sophia_core without has_rag_backend helper - assume no RAG.
+        core_has_rag = False
 
     # Read user-configured RAG decision-history settings (options flow)
     rag_enabled_cfg = entry.data.get("rag_decision_enabled", DEFAULT_RAG_ENABLED)
