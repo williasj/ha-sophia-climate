@@ -96,6 +96,15 @@
           "energy_priority": "Energy Priority",
           "aggressive_optimization": "Enable Aggressive Optimization"
         }
+      },
+      "rag_settings": {
+        "title": "RAG Decision History Settings",
+        "description": "{info}",
+        "data": {
+          "rag_decision_enabled": "Mirror decisions into Qdrant RAG collection",
+          "rag_decision_retention_days": "Retention (days)",
+          "rag_decision_memory_entries": "In-memory decisions for sensor"
+        }
       }
     }
   }
