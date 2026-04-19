@@ -8,7 +8,16 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    DEFAULT_RAG_ENABLED,
+    DEFAULT_RAG_RETENTION_DAYS,
+    DEFAULT_RAG_MEMORY_ENTRIES,
+    MIN_RAG_RETENTION_DAYS,
+    MAX_RAG_RETENTION_DAYS,
+    MIN_RAG_MEMORY_ENTRIES,
+    MAX_RAG_MEMORY_ENTRIES,
+)
 
 
 class SophiaClimateConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -129,6 +138,8 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
                 return await self.async_step_special_instructions()
             elif action == "sensors":
                 return await self.async_step_sensors()
+            elif action == "rag_settings":
+                return await self.async_step_rag_settings()
             else:
                 return self.async_create_entry(title="", data={})
 
@@ -141,6 +152,7 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
                         "energy_priority": "Update Energy Priority",
                         "special_instructions": "Update Special Instructions",
                         "sensors": "Update Sensor Configuration",
+                        "rag_settings": "Update RAG Decision History Settings",
                         "none": "Cancel (No Changes)",
                     }
                 )
@@ -391,6 +403,79 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
                     "is suppressed (default 60).\n\n"
                     "When outdoor humidity exceeds the limit, SOPHIA will use AC "
                     "instead of recommending open windows."
+                )
+            },
+        )
+
+    async def async_step_rag_settings(self, user_input=None):
+        """Update RAG decision-history settings (behavior and retention)"""
+
+        if user_input is not None:
+            new_data = dict(self._config_entry.data)
+            new_data["rag_decision_enabled"] = bool(
+                user_input.get("rag_decision_enabled", DEFAULT_RAG_ENABLED)
+            )
+            new_data["rag_decision_retention_days"] = int(
+                user_input.get(
+                    "rag_decision_retention_days", DEFAULT_RAG_RETENTION_DAYS
+                )
+            )
+            new_data["rag_decision_memory_entries"] = int(
+                user_input.get(
+                    "rag_decision_memory_entries", DEFAULT_RAG_MEMORY_ENTRIES
+                )
+            )
+            self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
+            return self.async_create_entry(title="", data={})
+
+        current = self._config_entry.data
+        current_enabled = current.get("rag_decision_enabled", DEFAULT_RAG_ENABLED)
+        current_retention = current.get(
+            "rag_decision_retention_days", DEFAULT_RAG_RETENTION_DAYS
+        )
+        current_memory = current.get(
+            "rag_decision_memory_entries", DEFAULT_RAG_MEMORY_ENTRIES
+        )
+
+        data_schema = vol.Schema(
+            {
+                vol.Required(
+                    "rag_decision_enabled", default=current_enabled
+                ): selector.BooleanSelector(),
+                vol.Required(
+                    "rag_decision_retention_days", default=current_retention
+                ): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=MIN_RAG_RETENTION_DAYS, max=MAX_RAG_RETENTION_DAYS),
+                ),
+                vol.Required(
+                    "rag_decision_memory_entries", default=current_memory
+                ): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=MIN_RAG_MEMORY_ENTRIES, max=MAX_RAG_MEMORY_ENTRIES),
+                ),
+            }
+        )
+
+        return self.async_show_form(
+            step_id="rag_settings",
+            data_schema=data_schema,
+            description_placeholders={
+                "info": (
+                    "RAG decision-history settings. These only take effect when "
+                    "SOPHIA Core has a Qdrant URL configured; otherwise climate "
+                    "decisions are retained in memory and on disk only.\n\n"
+                    "rag_decision_enabled: Mirror each climate decision into "
+                    "the sophia_climate_decisions Qdrant collection for long-term "
+                    "analysis.\n"
+                    "rag_decision_retention_days: Maximum age of decisions kept in "
+                    f"RAG ({MIN_RAG_RETENTION_DAYS}-{MAX_RAG_RETENTION_DAYS}, "
+                    f"default {DEFAULT_RAG_RETENTION_DAYS}). A nightly purge "
+                    "removes anything older.\n"
+                    "rag_decision_memory_entries: Number of most recent decisions "
+                    f"kept in memory for sensor attributes "
+                    f"({MIN_RAG_MEMORY_ENTRIES}-{MAX_RAG_MEMORY_ENTRIES}, "
+                    f"default {DEFAULT_RAG_MEMORY_ENTRIES})."
                 )
             },
         )

@@ -9,9 +9,17 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    DEFAULT_RAG_ENABLED,
+    DEFAULT_RAG_RETENTION_DAYS,
+    DEFAULT_RAG_MEMORY_ENTRIES,
+    RAG_COLLECTION_DECISIONS,
+    RAG_PURGE_INTERVAL_HOURS,
+)
 from .history_manager import ClimateHistoryManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -113,14 +121,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     registry = core_data["registry"]
     llm_client = core_data["llm_client"]
     
-    # Create history manager for file-based decision storage
+    # Ask sophia_core whether a RAG backend is available. Scoped integrations
+    # never probe Qdrant or TEI config directly - they use core's public API.
+    try:
+        core_has_rag = bool(llm_client.has_rag_backend())
+    except AttributeError:
+        # Older sophia_core without has_rag_backend helper - assume no RAG.
+        core_has_rag = False
+
+    # Read user-configured RAG decision-history settings (options flow)
+    rag_enabled_cfg = entry.data.get("rag_decision_enabled", DEFAULT_RAG_ENABLED)
+    rag_retention_days = entry.data.get(
+        "rag_decision_retention_days", DEFAULT_RAG_RETENTION_DAYS
+    )
+    rag_memory_entries = entry.data.get(
+        "rag_decision_memory_entries", DEFAULT_RAG_MEMORY_ENTRIES
+    )
+    rag_active = bool(core_has_rag and rag_enabled_cfg)
+
+    # Create history manager for file-based decision storage (and optional RAG mirror)
     history_manager = ClimateHistoryManager(
         hass=hass,
         config_dir=hass.config.config_dir,
-        max_memory_entries=20,  # Keep last 20 in memory for sensor
-        max_file_entries=500    # Keep 500 total on disk
+        max_memory_entries=rag_memory_entries,
+        max_file_entries=500,
+        llm_client=llm_client if rag_active else None,
+        rag_enabled=rag_active,
+        rag_collection=RAG_COLLECTION_DECISIONS,
+        rag_retention_days=rag_retention_days,
     )
     await history_manager.initialize()
+
+    # Schedule nightly RAG purge when RAG mirroring is active
+    if rag_active:
+        async def _purge_rag(_now):
+            removed = await history_manager.purge_rag_older_than()
+            if removed:
+                _LOGGER.info(
+                    "SOPHIA Climate: purged %d RAG decisions older than %d days",
+                    removed, rag_retention_days,
+                )
+
+        unsub_purge = async_track_time_interval(
+            hass, _purge_rag, timedelta(hours=RAG_PURGE_INTERVAL_HOURS)
+        )
+        entry.async_on_unload(unsub_purge)
     
     # Store module data
     hass.data.setdefault(DOMAIN, {})
