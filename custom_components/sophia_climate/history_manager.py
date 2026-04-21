@@ -156,7 +156,7 @@ class ClimateHistoryManager:
             return f"{value}{suffix}"
 
         text = (
-            f"Climate decision for zone {zone} on {day_str} at {time_str}: {decision}. "
+            f"[{ts_iso}] Climate decision for zone {zone} on {day_str} at {time_str}: {decision}. "
             f"Indoor {_fmt(indoor, 'F')}, target {_fmt(target, 'F')}, "
             f"outdoor {_fmt(outdoor, 'F')}, delta {_fmt(delta, 'F')}. "
             f"Season: {season}, sleep window: {bool(is_sleep)}. "
@@ -182,8 +182,9 @@ class ClimateHistoryManager:
             "timestamp": ts_iso,
         }
 
-        # Deterministic doc_id so repeated writes for the same (zone, timestamp) overwrite.
-        safe_ts = ts_iso[:19].replace(":", "-").replace(" ", "T")
+        # Deterministic doc_id using full millisecond precision to prevent
+        # collision between decisions in the same second for the same zone.
+        safe_ts = ts_iso[:23].replace(":", "-").replace(" ", "T").replace(".", "-")
         doc_id = f"decision_{zone}_{safe_ts}"
 
         return await self._llm.rag_upsert(
@@ -240,175 +241,4 @@ class ClimateHistoryManager:
                 _LOGGER.warning("History file corrupted, starting fresh")
                 return []
             except Exception as e:
-                _LOGGER.error(f"Error reading history file: {e}")
-                return []
-        
-        return await self.hass.async_add_executor_job(_read)
-    
-    async def _write_file(self, history: List[Dict[str, Any]]) -> None:
-        """Write history to file"""
-        # Ensure directory exists
-        self.history_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        def _write():
-            try:
-                # Write to temp file first, then rename (atomic operation)
-                temp_file = self.history_file.with_suffix('.tmp')
-                with open(temp_file, 'w', encoding='utf-8') as f:
-                    json.dump(history, f, indent=2, ensure_ascii=False)
-                temp_file.replace(self.history_file)
-            except Exception as e:
-                _LOGGER.error(f"Error writing history file: {e}")
-                raise
-        
-        await self.hass.async_add_executor_job(_write)
-    
-    async def _load_memory_history(self) -> None:
-        """Load recent history into memory cache"""
-        history = await self._read_file()
-        
-        # Load most recent entries into memory
-        for entry in history[:self.max_memory_entries]:
-            self.memory_history.append(entry)
-        
-        _LOGGER.info(f"Loaded {len(self.memory_history)} recent decisions into memory")
-    
-    def get_memory_history(self) -> List[Dict[str, Any]]:
-        """Get recent history from memory (for sensor attributes)
-        
-        Returns:
-            List of recent decisions (max max_memory_entries)
-        """
-        return list(self.memory_history)
-    
-    async def get_full_history(self, days: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Get full history from file, optionally filtered by days
-        
-        Args:
-            days: If provided, only return decisions from last N days
-            
-        Returns:
-            List of all decisions (or filtered)
-        """
-        history = await self._read_file()
-        
-        if days:
-            cutoff = datetime.now() - timedelta(days=days)
-            history = [
-                h for h in history 
-                if datetime.fromisoformat(h['timestamp']) > cutoff
-            ]
-        
-        return history
-    
-    async def get_statistics(self, use_cache: bool = True) -> Dict[str, Any]:
-        """Calculate statistics from history
-        
-        Args:
-            use_cache: Whether to use cached stats (refreshed every 60 seconds)
-            
-        Returns:
-            Dictionary with statistics
-        """
-        # Check cache
-        if use_cache and self._stats_cache and self._stats_cache_time:
-            age = (datetime.now() - self._stats_cache_time).total_seconds()
-            if age < self._stats_cache_duration:
-                return self._stats_cache
-        
-        # Calculate fresh stats
-        history = await self._read_file()
-        
-        total = len(history)
-        if total == 0:
-            return {
-                "total_decisions": 0,
-                "action_decisions": 0,
-                "no_change_decisions": 0,
-                "action_percentage": 0,
-                "stability_percentage": 0,
-            }
-        
-        action_decisions = sum(
-            1 for d in history 
-            if d.get("decision") != "NO_CHANGE"
-        )
-        no_change_decisions = total - action_decisions
-        
-        stats = {
-            "total_decisions": total,
-            "action_decisions": action_decisions,
-            "no_change_decisions": no_change_decisions,
-            "action_percentage": round((action_decisions / total * 100), 1),
-            "stability_percentage": round((no_change_decisions / total * 100), 1),
-        }
-        
-        # Cache results
-        self._stats_cache = stats
-        self._stats_cache_time = datetime.now()
-        
-        return stats
-    
-    async def cleanup_old(self, days: int = 30) -> int:
-        """Remove entries older than X days
-        
-        Args:
-            days: Remove entries older than this many days
-            
-        Returns:
-            Number of entries removed
-        """
-        cutoff = datetime.now() - timedelta(days=days)
-        history = await self._read_file()
-        
-        filtered = [
-            h for h in history 
-            if datetime.fromisoformat(h['timestamp']) > cutoff
-        ]
-        
-        removed = len(history) - len(filtered)
-        
-        if removed > 0:
-            await self._write_file(filtered)
-            _LOGGER.info(f"Cleaned up {removed} old history entries (older than {days} days)")
-        
-        return removed
-    
-    async def get_latest_decision(self) -> Optional[Dict[str, Any]]:
-        """Get the most recent decision
-        
-        Returns:
-            Latest decision entry or None
-        """
-        if self.memory_history:
-            return self.memory_history[0]
-        
-        history = await self._read_file()
-        return history[0] if history else None
-    
-    async def export_to_csv(self, filepath: str) -> None:
-        """Export history to CSV file for analysis
-        
-        Args:
-            filepath: Path to output CSV file
-        """
-        import csv
-        
-        history = await self._read_file()
-        
-        if not history:
-            _LOGGER.warning("No history to export")
-            return
-        
-        def _write_csv():
-            with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                # Get all keys from first entry
-                fieldnames = list(history[0].keys())
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                
-                writer.writeheader()
-                for entry in history:
-                    writer.writerow(entry)
-        
-        await self.hass.async_add_executor_job(_write_csv)
-        _LOGGER.info(f"Exported {len(history)} decisions to {filepath}")
+  
