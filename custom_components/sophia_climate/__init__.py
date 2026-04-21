@@ -527,7 +527,8 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self.llm_client = llm_client
         self.history_manager = history_manager
-        
+        self._check_in_progress = False
+
         # Parse zones
         zones = entry.data.get("zones", [])
         if zones and isinstance(zones[0], dict):
@@ -567,7 +568,18 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
         
     async def _async_update_data(self):
         """Fetch data from API endpoint"""
-        
+        if self._check_in_progress:
+            _LOGGER.debug("Climate check already in progress, skipping duplicate trigger")
+            return self.data
+
+        self._check_in_progress = True
+        try:
+            return await self._run_climate_check()
+        finally:
+            self._check_in_progress = False
+
+    async def _run_climate_check(self):
+        """Execute the climate check logic."""
         _LOGGER.info("Running SOPHIA climate check...")
         
         # Determine season and time
