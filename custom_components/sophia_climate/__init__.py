@@ -429,9 +429,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     # Register services
     async def handle_run_climate_check(call):
-        """Handle manual climate check service call"""
+        """Handle manual climate check service call.
+
+        Bypasses the DataUpdateCoordinator debouncer to prevent the
+        double-fire that occurs when async_request_refresh() triggers
+        an immediate run and then re-queues after cooldown.
+        """
+        if coordinator._check_in_progress:
+            _LOGGER.info("Climate check already in progress, skipping manual trigger")
+            return
         _LOGGER.info("Manual climate check triggered")
-        await coordinator.async_request_refresh()
+        coordinator._check_in_progress = True
+        try:
+            data = await coordinator._run_climate_check()
+            coordinator.async_set_updated_data(data)
+        finally:
+            coordinator._check_in_progress = False
     
     async def handle_set_zone_target(call):
         """Handle set zone target temperature"""
