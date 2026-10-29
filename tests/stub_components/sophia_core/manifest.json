@@ -1,0 +1,9 @@
+{
+  "domain": "sophia_core",
+  "name": "SOPHIA Core (test stub)",
+  "version": "0.0.0-test",
+  "dependencies": [],
+  "codeowners": [],
+  "requirements": [],
+  "iot_class": "calculated"
+}

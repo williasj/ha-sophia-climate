@@ -17,7 +17,57 @@ from .const import (
     MAX_RAG_RETENTION_DAYS,
     MIN_RAG_MEMORY_ENTRIES,
     MAX_RAG_MEMORY_ENTRIES,
+    DEFAULT_ZONE_PRIORITY,
+    MIN_ZONE_PRIORITY,
+    MAX_ZONE_PRIORITY,
 )
+
+
+
+SEASONS = ("winter", "spring", "summer", "fall")
+SEASON_DEFAULTS = {
+    "winter": {"target": 72, "sleep": 68},
+    "spring": {"target": 72, "sleep": 68},
+    "summer": {"target": 70, "sleep": 66},
+    "fall": {"target": 72, "sleep": 68},
+}
+TEMP_VALIDATOR = vol.All(vol.Coerce(int), vol.Range(min=60, max=85))
+
+
+def _saved_temp(saved: dict, season: str, kind: str) -> int:
+    """Stored target/sleep for a season, or the default when missing."""
+    value = (saved or {}).get(season, {}).get(kind)
+    if value is None:
+        value = SEASON_DEFAULTS[season][kind]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return SEASON_DEFAULTS[season][kind]
+
+
+def _seasonal_fields(saved: dict) -> dict:
+    """All eight temps as required fields, pre-filled with the saved values.
+
+    Every field is required and shows its stored value, so saving a form
+    never silently replaces a temperature the user did not touch.
+    """
+    fields = {}
+    for season in SEASONS:
+        for kind in ("target", "sleep"):
+            fields[vol.Required(
+                f"{season}_{kind}", default=_saved_temp(saved, season, kind)
+            )] = TEMP_VALIDATOR
+    return fields
+
+
+def _seasonal_from_input(user_input: dict) -> dict:
+    return {
+        season: {
+            "target": int(user_input[f"{season}_target"]),
+            "sleep": int(user_input[f"{season}_sleep"]),
+        }
+        for season in SEASONS
+    }
 
 
 class SophiaClimateConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -121,6 +171,7 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
     def __init__(self, config_entry):
         """Initialize options flow"""
         self._config_entry = config_entry
+        self._selected_zone_id = None
 
     async def async_step_init(self, user_input=None):
         """Manage the options - show menu of what to configure"""
@@ -130,8 +181,8 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
 
             if action == "check_interval":
                 return await self.async_step_check_interval()
-            elif action == "seasonal_temps":
-                return await self.async_step_seasonal_temps()
+            elif action == "edit_zone":
+                return await self.async_step_edit_zone()
             elif action == "energy_priority":
                 return await self.async_step_energy_priority()
             elif action == "special_instructions":
@@ -140,6 +191,10 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
                 return await self.async_step_sensors()
             elif action == "rag_settings":
                 return await self.async_step_rag_settings()
+            elif action == "add_zone":
+                return await self.async_step_add_zone()
+            elif action == "remove_zone":
+                return await self.async_step_remove_zone()
             else:
                 return self.async_create_entry(title="", data={})
 
@@ -148,11 +203,11 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional("action"): vol.In(
                     {
                         "check_interval": "Update Check Interval",
-                        "seasonal_temps": "Update Seasonal Temperatures",
-                        "energy_priority": "Update Energy Priority",
-                        "special_instructions": "Update Special Instructions",
+                        "edit_zone": "Edit Zone Comfort & Settings",
                         "sensors": "Update Sensor Configuration",
                         "rag_settings": "Update RAG Decision History Settings",
+                        "add_zone": "Add a Zone",
+                        "remove_zone": "Remove a Zone",
                         "none": "Cancel (No Changes)",
                     }
                 )
@@ -201,28 +256,7 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
 
         if user_input is not None:
             new_data = dict(self._config_entry.data)
-            new_data["seasonal_temps"] = {
-                "winter": {
-                    "target": user_input["winter_target"],
-                    "sleep": user_input["winter_sleep"],
-                },
-                "spring": {
-                    "target": user_input["spring_target"],
-                    "sleep": user_input.get(
-                        "spring_sleep", user_input["spring_target"] - 4
-                    ),
-                },
-                "summer": {
-                    "target": user_input["summer_target"],
-                    "sleep": user_input["summer_sleep"],
-                },
-                "fall": {
-                    "target": user_input["fall_target"],
-                    "sleep": user_input.get(
-                        "fall_sleep", user_input["fall_target"] - 4
-                    ),
-                },
-            }
+            new_data["seasonal_temps"] = _seasonal_from_input(user_input)
             self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
             return self.async_create_entry(title="", data={})
 
@@ -230,36 +264,7 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
 
         data_schema = vol.Schema(
             {
-                vol.Required(
-                    "winter_target",
-                    default=current_temps.get("winter", {}).get("target", 72),
-                ): vol.All(vol.Coerce(int), vol.Range(min=60, max=85)),
-                vol.Required(
-                    "winter_sleep",
-                    default=current_temps.get("winter", {}).get("sleep", 68),
-                ): vol.All(vol.Coerce(int), vol.Range(min=60, max=85)),
-                vol.Required(
-                    "spring_target",
-                    default=current_temps.get("spring", {}).get("target", 72),
-                ): vol.All(vol.Coerce(int), vol.Range(min=60, max=85)),
-                vol.Optional("spring_sleep"): vol.All(
-                    vol.Coerce(int), vol.Range(min=60, max=85)
-                ),
-                vol.Required(
-                    "summer_target",
-                    default=current_temps.get("summer", {}).get("target", 70),
-                ): vol.All(vol.Coerce(int), vol.Range(min=60, max=85)),
-                vol.Required(
-                    "summer_sleep",
-                    default=current_temps.get("summer", {}).get("sleep", 66),
-                ): vol.All(vol.Coerce(int), vol.Range(min=60, max=85)),
-                vol.Required(
-                    "fall_target",
-                    default=current_temps.get("fall", {}).get("target", 72),
-                ): vol.All(vol.Coerce(int), vol.Range(min=60, max=85)),
-                vol.Optional("fall_sleep"): vol.All(
-                    vol.Coerce(int), vol.Range(min=60, max=85)
-                ),
+                **_seasonal_fields(current_temps),
             }
         )
 
@@ -271,7 +276,7 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
                     "Set your ideal temperatures for each season.\n\n"
                     "Target: Comfortable temp when awake\n"
                     "Sleep: Temperature for nighttime (10 PM - 6 AM)\n\n"
-                    "Leave spring/fall sleep temps empty to use target - 4 degrees F"
+                    "All eight temperatures are required and show their saved values."
                 )
             },
         )
@@ -476,6 +481,269 @@ class SophiaClimateOptionsFlowHandler(config_entries.OptionsFlow):
                     f"kept in memory for sensor attributes "
                     f"({MIN_RAG_MEMORY_ENTRIES}-{MAX_RAG_MEMORY_ENTRIES}, "
                     f"default {DEFAULT_RAG_MEMORY_ENTRIES})."
+                )
+            },
+        )
+    async def async_step_add_zone(self, user_input=None):
+        """Add a new climate zone"""
+
+        errors = {}
+
+        existing_zones = list(self._config_entry.data.get("zones", []))
+        existing_ids = {
+            z.get("id") if isinstance(z, dict) else str(z).lower().replace(" ", "_")
+            for z in existing_zones
+        }
+
+        if user_input is not None:
+            zone_name = user_input.get("zone_name", "").strip()
+            thermostat = user_input.get("thermostat", "").strip()
+            temp_sensor = user_input.get("temp_sensor", "").strip() or None
+            priority = int(user_input.get("priority", DEFAULT_ZONE_PRIORITY))
+
+            if not zone_name:
+                errors["zone_name"] = "zone_name_required"
+            elif not thermostat:
+                errors["thermostat"] = "thermostat_required"
+            else:
+                zone_id = zone_name.lower().replace(" ", "_")
+                if zone_id in existing_ids:
+                    errors["zone_name"] = "zone_exists"
+
+            if not errors:
+                new_zone = {
+                    "id": zone_id,
+                    "name": zone_name,
+                    "thermostat": thermostat,
+                    "temp_sensor": temp_sensor,
+                    "priority": priority,
+                    "enabled": True,
+                    "seasonal_temps": {
+                        "winter": {"target": 72, "sleep": 68},
+                        "spring": {"target": 72, "sleep": 68},
+                        "summer": {"target": 70, "sleep": 66},
+                        "fall": {"target": 72, "sleep": 68},
+                    },
+                    "energy_priority": "balanced",
+                    "aggressive_optimization": False,
+                    "special_instructions": "",
+                }
+                new_data = dict(self._config_entry.data)
+                new_data["zones"] = existing_zones + [new_zone]
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry, data=new_data
+                )
+                return self.async_create_entry(title="", data={})
+
+        data_schema = vol.Schema(
+            {
+                vol.Required("zone_name"): str,
+                vol.Required("thermostat"): selector.selector(
+                    {"entity": {"domain": "climate"}}
+                ),
+                vol.Optional("temp_sensor"): selector.selector(
+                    {"entity": {"domain": "sensor", "device_class": "temperature"}}
+                ),
+                vol.Required(
+                    "priority", default=DEFAULT_ZONE_PRIORITY
+                ): selector.selector(
+                    {
+                        "number": {
+                            "min": MIN_ZONE_PRIORITY,
+                            "max": MAX_ZONE_PRIORITY,
+                            "step": 1,
+                            "mode": "slider",
+                        }
+                    }
+                ),
+            }
+        )
+
+        return self.async_show_form(
+            step_id="add_zone",
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders={
+                "info": (
+                    "Add a new climate zone.\n\n"
+                    "Zone Name: human-readable name (e.g. 'Upstairs'). The entity "
+                    "IDs sensor.sophia_<id>_zone_status and switch.sophia_<id>_zone "
+                    "are derived from a lowercased, underscored version of this name.\n"
+                    "Thermostat: the climate entity SOPHIA will control for this zone.\n"
+                    "Temp Sensor: optional dedicated indoor temperature sensor. Leave "
+                    "blank to use the thermostat's own reading.\n"
+                    f"Priority: {MIN_ZONE_PRIORITY}-{MAX_ZONE_PRIORITY} "
+                    f"(default {DEFAULT_ZONE_PRIORITY}).\n\n"
+                    "SOPHIA reloads automatically after saving; the new zone's "
+                    "sensor and switch are created on reload."
+                )
+            },
+        )
+
+    async def async_step_remove_zone(self, user_input=None):
+        """Remove an existing climate zone"""
+
+        errors = {}
+        existing_zones = list(self._config_entry.data.get("zones", []))
+
+        def _zid(z):
+            return z.get("id") if isinstance(z, dict) else str(z).lower().replace(" ", "_")
+
+        def _zname(z):
+            return z.get("name", _zid(z)) if isinstance(z, dict) else str(z)
+
+        choices = {_zid(z): _zname(z) for z in existing_zones}
+
+        if user_input is not None:
+            target = user_input.get("zone_id")
+            if len(existing_zones) <= 1:
+                errors["base"] = "cannot_remove_last"
+            elif target not in choices:
+                errors["zone_id"] = "zone_not_found"
+            else:
+                new_zones = [z for z in existing_zones if _zid(z) != target]
+                new_data = dict(self._config_entry.data)
+                new_data["zones"] = new_zones
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry, data=new_data
+                )
+                return self.async_create_entry(title="", data={})
+
+        if len(existing_zones) <= 1:
+            return self.async_abort(reason="cannot_remove_last")
+
+        data_schema = vol.Schema({vol.Required("zone_id"): vol.In(choices)})
+
+        return self.async_show_form(
+            step_id="remove_zone",
+            data_schema=data_schema,
+            errors=errors,
+            description_placeholders={
+                "info": (
+                    "Select a zone to remove. Its sensor and switch entities are "
+                    "deleted on the automatic reload that follows. The decision "
+                    "history stored in RAG/on disk is not purged."
+                )
+            },
+        )
+
+    async def async_step_edit_zone(self, user_input=None):
+        """Pick which zone's comfort settings to edit"""
+
+        zones = list(self._config_entry.data.get("zones", []))
+        choices = {}
+        for z in zones:
+            if isinstance(z, dict):
+                zid = z.get("id")
+                choices[zid] = z.get("name", zid)
+
+        if not choices:
+            return self.async_abort(reason="no_zones")
+
+        # Single zone: skip the picker
+        if len(choices) == 1 and user_input is None:
+            self._selected_zone_id = next(iter(choices))
+            return await self.async_step_zone_settings()
+
+        if user_input is not None:
+            self._selected_zone_id = user_input["zone_id"]
+            return await self.async_step_zone_settings()
+
+        data_schema = vol.Schema({vol.Required("zone_id"): vol.In(choices)})
+
+        return self.async_show_form(
+            step_id="edit_zone",
+            data_schema=data_schema,
+            description_placeholders={
+                "info": "Choose which zone's comfort temperatures and settings to edit."
+            },
+        )
+
+    async def async_step_zone_settings(self, user_input=None):
+        """Edit one zone's own comfort temps, energy priority, and instructions"""
+
+        zones = list(self._config_entry.data.get("zones", []))
+        idx = None
+        for i, z in enumerate(zones):
+            if isinstance(z, dict) and z.get("id") == self._selected_zone_id:
+                idx = i
+                break
+
+        if idx is None:
+            return self.async_abort(reason="zone_not_found")
+
+        zone = dict(zones[idx])
+        zone_name = zone.get("name", self._selected_zone_id)
+        st = zone.get("seasonal_temps", {})
+
+        if user_input is not None:
+            zone["seasonal_temps"] = _seasonal_from_input(user_input)
+            zone["energy_priority"] = user_input["energy_priority"]
+            zone["aggressive_optimization"] = user_input.get(
+                "aggressive_optimization", False
+            )
+            zone["special_instructions"] = user_input.get("special_instructions", "")
+            if "priority" in user_input:
+                zone["priority"] = int(user_input["priority"])
+
+            new_zones = list(zones)
+            new_zones[idx] = zone
+            new_data = dict(self._config_entry.data)
+            new_data["zones"] = new_zones
+            self.hass.config_entries.async_update_entry(
+                self._config_entry, data=new_data
+            )
+            return self.async_create_entry(title="", data={})
+
+        data_schema = vol.Schema(
+            {
+                **_seasonal_fields(st),
+                vol.Required(
+                    "energy_priority",
+                    default=zone.get("energy_priority", "balanced"),
+                ): vol.In(
+                    {
+                        "comfort": "Comfort First - Prioritize comfort over savings",
+                        "balanced": "Balanced - Balance comfort and efficiency (recommended)",
+                        "savings": "Savings First - Prioritize energy savings",
+                    }
+                ),
+                vol.Optional(
+                    "aggressive_optimization",
+                    default=zone.get("aggressive_optimization", False),
+                ): bool,
+                vol.Required(
+                    "priority",
+                    default=zone.get("priority", DEFAULT_ZONE_PRIORITY),
+                ): selector.selector(
+                    {
+                        "number": {
+                            "min": MIN_ZONE_PRIORITY,
+                            "max": MAX_ZONE_PRIORITY,
+                            "step": 1,
+                            "mode": "slider",
+                        }
+                    }
+                ),
+                vol.Optional(
+                    "special_instructions",
+                    default=zone.get("special_instructions", ""),
+                ): str,
+            }
+        )
+
+        return self.async_show_form(
+            step_id="zone_settings",
+            data_schema=data_schema,
+            description_placeholders={
+                "info": (
+                    f"Comfort settings for the '{zone_name}' zone only. These are "
+                    "independent per zone - changing them here does not affect any "
+                    "other zone.\n\n"
+                    "Target: comfortable temp when awake. Sleep: nighttime temp "
+                    "(10 PM - 6 AM). All eight temperatures are required.\n"
+                    "Energy Priority and Special Instructions apply to this zone's "
+                    "own SOPHIA decisions."
                 )
             },
         )
