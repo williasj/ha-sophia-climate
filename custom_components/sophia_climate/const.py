@@ -41,6 +41,30 @@ MAX_ZONE_PRIORITY = 10
 MIN_TEMP = 60
 MAX_TEMP = 80
 
+# HVAC regime detection
+# The calendar alone is a bad guide to whether heating is ever appropriate.
+# SOPHIA looks at the recent outdoor high to decide which direction of
+# conditioning is physically sensible right now.
+REGIME_COOLING = "cooling"   # heating is locked out
+REGIME_HEATING = "heating"   # cooling is locked out
+REGIME_NEUTRAL = "neutral"   # shoulder conditions, both allowed
+
+REGIME_LOOKBACK_HOURS = 24
+REGIME_MAX_SAMPLES = 300
+
+# If the outdoor high in the lookback window reached this, we are in
+# cooling weather and the furnace must not run to close a comfort gap.
+REGIME_COOLING_RECENT_HIGH = 75
+
+# If the outdoor high in the lookback window never got above this, we are
+# in heating weather and the AC must not run to close a comfort gap.
+REGIME_HEATING_RECENT_HIGH = 60
+
+# Outside the summer months, a warm recent high only implies cooling regime
+# if it is not actually cold outside at this moment. Protects the classic
+# fall pattern of a 78F afternoon followed by a 38F night.
+REGIME_OUTDOOR_FLOOR = 55
+
 # RAG decision history (stored in Qdrant via sophia_core)
 RAG_COLLECTION_DECISIONS = "sophia_climate_decisions"
 DEFAULT_RAG_ENABLED = True

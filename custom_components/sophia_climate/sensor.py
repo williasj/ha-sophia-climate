@@ -475,33 +475,9 @@ class SophiaClimateDecisionHistorySensor(CoordinatorEntity, SensorEntity):
         is_sleep_time = self.coordinator.data.get("is_sleep_time")
         zones_data = self.coordinator.data.get("zones", {})
         
-        # Add ALL decisions to history (including NO_CHANGE) using history manager
-        for zone_id, decision in decisions.items():
-            zone_data = zones_data.get(zone_id, {})
-            
-            decision_entry = {
-                "zone": zone_id,
-                "decision": decision.get("decision"),
-                "reasoning": decision.get("reasoning"),
-                "timestamp": timestamp,
-                "outdoor_temp": outdoor_temp,
-                "season": season,
-                "is_sleep_time": is_sleep_time,
-                "indoor_temp": zone_data.get("indoor_temp"),
-                "target_temp": zone_data.get("target_temp"),
-                "hvac_mode": zone_data.get("hvac_mode"),
-                "hvac_action": zone_data.get("hvac_action"),
-                "temp_delta": round(
-                    ((zone_data.get("indoor_temp") or 0) - (zone_data.get("target_temp") or 0)),
-                    1
-                ),
-            }
-            
-            # Add to history manager (async, fire and forget)
-            self._hass.async_create_task(
-                self._history_manager.add_decision(decision_entry)
-            )
-        
+        # History is recorded by the coordinator in _run_climate_check.
+        # Do not call add_decision here -- doing so causes every coordinator
+        # update to log a duplicate entry.
         super()._handle_coordinator_update()
 
 

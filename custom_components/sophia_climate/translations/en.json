@@ -105,7 +105,60 @@
           "rag_decision_retention_days": "Retention (days)",
           "rag_decision_memory_entries": "In-memory decisions for sensor"
         }
+      },
+      "add_zone": {
+        "title": "Add a Zone",
+        "description": "{info}",
+        "data": {
+          "zone_name": "Zone Name",
+          "thermostat": "Thermostat",
+          "temp_sensor": "Indoor Temp Sensor (optional)",
+          "priority": "Priority"
+        }
+      },
+      "remove_zone": {
+        "title": "Remove a Zone",
+        "description": "{info}",
+        "data": {
+          "zone_id": "Zone"
+        }
+      },
+      "edit_zone": {
+        "title": "Edit Zone",
+        "description": "{info}",
+        "data": {
+          "zone_id": "Zone"
+        }
+      },
+      "zone_settings": {
+        "title": "Zone Comfort & Settings",
+        "description": "{info}",
+        "data": {
+          "winter_target": "Winter Target",
+          "winter_sleep": "Winter Sleep",
+          "spring_target": "Spring Target",
+          "spring_sleep": "Spring Sleep",
+          "summer_target": "Summer Target",
+          "summer_sleep": "Summer Sleep",
+          "fall_target": "Fall Target",
+          "fall_sleep": "Fall Sleep",
+          "energy_priority": "Energy Priority",
+          "aggressive_optimization": "Aggressive Optimization",
+          "priority": "Zone Priority",
+          "special_instructions": "Special Instructions"
+        }
       }
+    },
+    "error": {
+      "zone_name_required": "Zone name is required.",
+      "thermostat_required": "A thermostat entity is required.",
+      "zone_exists": "A zone with that name already exists.",
+      "zone_not_found": "That zone no longer exists."
+    },
+    "abort": {
+      "cannot_remove_last": "Cannot remove the only remaining zone.",
+      "no_zones": "No zones are configured yet. Add a zone first.",
+      "zone_not_found": "That zone no longer exists."
     }
   }
 }

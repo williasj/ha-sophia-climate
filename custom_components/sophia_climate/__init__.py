@@ -3,13 +3,15 @@
 SOPHIA Climate - Multi-zone HVAC control with AI decision making
 Registers with SOPHIA Core for LLM access and capability discovery
 """
+import copy
 import logging
+from collections import deque
 from datetime import timedelta, datetime
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.core import CoreState, HomeAssistant, ServiceCall, callback
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
@@ -19,8 +21,31 @@ from .const import (
     DEFAULT_RAG_MEMORY_ENTRIES,
     RAG_COLLECTION_DECISIONS,
     RAG_PURGE_INTERVAL_HOURS,
+    SEASON_SUMMER,
+    SEASON_WINTER,
+    REGIME_COOLING,
+    REGIME_HEATING,
+    REGIME_NEUTRAL,
+    REGIME_LOOKBACK_HOURS,
+    REGIME_MAX_SAMPLES,
+    REGIME_COOLING_RECENT_HIGH,
+    REGIME_HEATING_RECENT_HIGH,
+    REGIME_OUTDOOR_FLOOR,
 )
 from .history_manager import ClimateHistoryManager
+
+# Entity states that carry no usable number.
+UNAVAILABLE_STATES = ("unavailable", "unknown", "none", "")
+
+# How old a remembered outdoor reading may be and still stand in for a dead
+# outdoor sensor. Older than this, SOPHIA leaves the thermostats alone.
+OUTDOOR_LAST_KNOWN_MAX_HOURS = 3
+
+# A configured thermostat that is not loaded yet (typically the cloud
+# integration still starting after a Home Assistant restart) triggers a quick
+# retry instead of waiting for the next regular check.
+MISSING_THERMOSTAT_RETRY_SECONDS = 60
+MISSING_THERMOSTAT_MAX_RETRIES = 10
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -101,6 +126,57 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
     return True
 
 
+DEFAULT_SEASONAL_TEMPS = {
+    "winter": {"target": 72, "sleep": 68},
+    "spring": {"target": 72, "sleep": 68},
+    "summer": {"target": 70, "sleep": 66},
+    "fall": {"target": 72, "sleep": 68},
+}
+
+
+def _ensure_zone_settings(data: dict):
+    """Seed per-zone comfort settings from legacy global values.
+
+    Each zone owns its own seasonal_temps, energy_priority,
+    aggressive_optimization, and special_instructions. Older entries kept
+    these at the top level shared across all zones; this migrates them into
+    each zone the first time, using the global value as the seed so behavior
+    is unchanged until the user edits a specific zone.
+
+    Returns (new_data, changed).
+    """
+    changed = False
+    global_seasonal = data.get("seasonal_temps", DEFAULT_SEASONAL_TEMPS)
+    global_priority = data.get("energy_priority", "balanced")
+    global_aggressive = data.get("aggressive_optimization", False)
+    global_special = data.get("special_instructions", "")
+
+    new_zones = []
+    for zone in data.get("zones", []):
+        if not isinstance(zone, dict):
+            new_zones.append(zone)
+            continue
+        z = dict(zone)
+        if "seasonal_temps" not in z:
+            z["seasonal_temps"] = copy.deepcopy(global_seasonal)
+            changed = True
+        if "energy_priority" not in z:
+            z["energy_priority"] = global_priority
+            changed = True
+        if "aggressive_optimization" not in z:
+            z["aggressive_optimization"] = global_aggressive
+            changed = True
+        if "special_instructions" not in z:
+            z["special_instructions"] = global_special
+            changed = True
+        new_zones.append(z)
+
+    if changed:
+        data = dict(data)
+        data["zones"] = new_zones
+    return data, changed
+
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up SOPHIA Climate from configuration.yaml (legacy)"""
     return True
@@ -115,6 +191,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if "sophia_core" not in hass.data:
         _LOGGER.error("SOPHIA Core not found! Climate module requires Core.")
         return False
+
+    # Ensure each zone carries its own comfort settings (seeded from any
+    # legacy global values). Persist once if anything was migrated.
+    _migrated_data, _zone_changed = _ensure_zone_settings(entry.data)
+    if _zone_changed:
+        hass.config_entries.async_update_entry(entry, data=_migrated_data)
+        _LOGGER.info("SOPHIA Climate: migrated global comfort settings into per-zone config")
     
     # Get references to Core services
     core_data = hass.data["sophia_core"]
@@ -179,6 +262,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Create coordinator for climate control
     coordinator = SophiaClimateCoordinator(hass, entry, llm_client, history_manager)
     await coordinator.async_config_entry_first_refresh()
+    entry.async_on_unload(coordinator.cancel_missing_retry)
     
     hass.data[DOMAIN][entry.entry_id]["coordinator"] = coordinator
     
@@ -204,6 +288,60 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _first_zone_thermostat = _first_zone.get("thermostat", "") if isinstance(_first_zone, dict) else ""
     _outdoor_sensor = entry.data.get("outdoor_temp_sensor", "sensor.outdoor_temperature")
     _first_zone_status = f"sensor.sophia_{_first_zone_id}_zone_status"
+
+    def _zone_id_name(zone):
+        """Return (zone_id, zone_name, thermostat) for a zone (dict or v1 string)."""
+        if isinstance(zone, dict):
+            zid = zone.get("id")
+            zname = zone.get("name") or (zid.title() if zid else "Zone")
+            thermostat = zone.get("thermostat", "")
+        else:
+            zid = zone.lower().replace(" ", "_")
+            zname = zone.title()
+            thermostat = ""
+        return zid, zname, thermostat
+
+    def _build_zone_graph_cards(zones, outdoor):
+        """One temperature graph per zone so each zone is tracked separately."""
+        cards = []
+        for zone in zones:
+            zid, zname, thermostat = _zone_id_name(zone)
+            if not thermostat:
+                continue
+            cards.append({
+                "type": "history-graph",
+                "title": f"{zname} - Temperature (24h)",
+                "entities": [
+                    {"entity": thermostat, "name": zname},
+                    {"entity": outdoor, "name": "Outdoor"},
+                ],
+                "hours_to_show": 24,
+            })
+        return cards
+
+    def _build_zone_decision_cards(zones):
+        """Per-zone card showing that zone's own SOPHIA decision and temps."""
+        cards = []
+        for zone in zones:
+            zid, zname, _ = _zone_id_name(zone)
+            status = f"sensor.sophia_{zid}_zone_status"
+            cards.append({
+                "type": "entities",
+                "title": f"{zname} - SOPHIA Decision",
+                "state_color": False,
+                "entities": [
+                    {"entity": status, "name": "HVAC Action"},
+                    {"type": "attribute", "entity": status, "attribute": "indoor_temp", "name": "Indoor Temp"},
+                    {"type": "attribute", "entity": status, "attribute": "target_temp", "name": "Thermostat Setpoint"},
+                    {"type": "attribute", "entity": status, "attribute": "priority", "name": "Priority"},
+                    {"type": "attribute", "entity": status, "attribute": "last_decision", "name": "Last Decision"},
+                    {"type": "attribute", "entity": status, "attribute": "last_reasoning", "name": "Reasoning"},
+                ],
+            })
+        return cards
+
+    _zone_graph_cards = _build_zone_graph_cards(_zones_for_dash, _outdoor_sensor)
+    _zone_decision_cards = _build_zone_decision_cards(_zones_for_dash)
 
     # Build capabilities dict with ENHANCED dashboard config
     capabilities = {
@@ -257,16 +395,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     ]
                 },
                 
-                # Temperature History Graph
-                {
-                    "type": "history-graph",
-                    "title": "Temperature Last 24 Hours",
-                    "entities": [
-                        {"entity": _first_zone_thermostat, "name": "Indoor"},
-                        {"entity": _outdoor_sensor, "name": "Outdoor"}
-                    ],
-                    "hours_to_show": 24
-                },
+                # Per-Zone Temperature History Graphs (each zone tracked separately)
+                *_zone_graph_cards,
                 
                 # Efficiency Score Gauge
                 {
@@ -305,6 +435,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "show_header_toggle": False,
                     "entities": _build_zone_entities(entry.data.get("zones", []))
                 },
+
+                # Per-Zone SOPHIA Decisions (each zone decided independently)
+                *_zone_decision_cards,
                 
                 # Decision Statistics
                 {
@@ -429,9 +562,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     # Register services
     async def handle_run_climate_check(call):
-        """Handle manual climate check service call"""
+        """Handle manual climate check service call.
+
+        Bypasses the DataUpdateCoordinator debouncer to prevent the
+        double-fire that occurs when async_request_refresh() triggers
+        an immediate run and then re-queues after cooldown.
+        """
+        if coordinator._check_in_progress:
+            _LOGGER.info("Climate check already in progress, skipping manual trigger")
+            return
         _LOGGER.info("Manual climate check triggered")
-        await coordinator.async_request_refresh()
+        coordinator._check_in_progress = True
+        try:
+            data = await coordinator._run_climate_check()
+            coordinator.async_set_updated_data(data)
+        finally:
+            coordinator._check_in_progress = False
     
     async def handle_set_zone_target(call):
         """Handle set zone target temperature"""
@@ -527,7 +673,18 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self.llm_client = llm_client
         self.history_manager = history_manager
-        
+        self._check_in_progress = False
+
+        # Rolling outdoor temperature samples, used to decide whether we are
+        # in heating or cooling weather. Seeded from the decision history on
+        # the first check after a restart so a fresh boot is not blind.
+        self._outdoor_samples = deque(maxlen=REGIME_MAX_SAMPLES)
+        self._trend_seeded = False
+        self._outdoor_source_reported = None
+        self._cached_stats = {}
+        self._missing_retry_unsub = None
+        self._missing_retries = 0
+
         # Parse zones
         zones = entry.data.get("zones", [])
         if zones and isinstance(zones[0], dict):
@@ -556,7 +713,7 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
         return hour >= 22 or hour < 6
     
     def _get_target_temp(self, season: str, is_sleep: bool) -> float:
-        """Get target temperature for season and time"""
+        """Get target temperature for season and time (global fallback)"""
         seasonal_temps = self.entry.data.get("seasonal_temps", {})
         season_temps = seasonal_temps.get(season, {"target": 72, "sleep": 68})
         
@@ -564,10 +721,306 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
             return season_temps.get("sleep", 68)
         else:
             return season_temps.get("target", 72)
-        
+
+    def _get_zone_target_temp(self, zone, season: str, is_sleep: bool) -> float:
+        """Get this zone's own target temperature for the season and time.
+
+        Falls back to the legacy global seasonal_temps only if the zone has
+        no seasonal_temps of its own (pre-migration entries).
+        """
+        seasonal = None
+        if isinstance(zone, dict):
+            seasonal = zone.get("seasonal_temps")
+        if not seasonal:
+            seasonal = self.entry.data.get("seasonal_temps", {})
+        season_temps = seasonal.get(season, {"target": 72, "sleep": 68})
+        if is_sleep:
+            return season_temps.get("sleep", 68)
+        return season_temps.get("target", 72)
+
+    async def _seed_outdoor_trend(self) -> None:
+        """Seed the outdoor trend from decision history after a restart.
+
+        Without this, the first checks after a Home Assistant restart have no
+        idea what the weather has been doing and would fall back to the
+        calendar season, which is exactly the mistake we are trying to avoid
+        in shoulder months.
+        """
+        if self._trend_seeded:
+            return
+        self._trend_seeded = True
+        try:
+            history = await self.history_manager.get_full_history(days=2)
+        except Exception as err:
+            _LOGGER.debug("Could not seed outdoor trend from history: %s", err)
+            return
+
+        seeded = 0
+        for entry in reversed(history):
+            outdoor = entry.get("outdoor_temp")
+            stamp = entry.get("timestamp")
+            if outdoor is None or not stamp:
+                continue
+            try:
+                when = datetime.fromisoformat(stamp)
+                self._outdoor_samples.append((when, float(outdoor)))
+                seeded += 1
+            except (ValueError, TypeError):
+                continue
+
+        if seeded:
+            _LOGGER.info(
+                "SOPHIA Climate: seeded outdoor trend with %d historical samples", seeded
+            )
+
+    def _record_outdoor(self, outdoor_temp: float) -> None:
+        """Record an outdoor temperature sample for regime detection."""
+        try:
+            self._outdoor_samples.append((datetime.now(), float(outdoor_temp)))
+        except (ValueError, TypeError):
+            pass
+
+    def _recent_outdoor_high(self, hours: int = REGIME_LOOKBACK_HOURS):
+        """Highest outdoor temperature seen in the lookback window, or None."""
+        cutoff = datetime.now() - timedelta(hours=hours)
+        recent = [temp for when, temp in self._outdoor_samples if when >= cutoff]
+        if not recent:
+            return None
+        return max(recent)
+
+    # ------------------------------------------------------------------
+    # Sensor reading helpers. None of these raise on unavailable/unknown
+    # states: a dead sensor must never take the whole climate check down.
+    # ------------------------------------------------------------------
+
+    def _state_float(self, entity_id):
+        """Return an entity's numeric state, or None when it has no number."""
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None or str(state.state).lower() in UNAVAILABLE_STATES:
+            return None
+        try:
+            return float(state.state)
+        except (TypeError, ValueError):
+            return None
+
+    def _weather_fallback(self):
+        """First working weather entity as (temp_f, humidity, entity_id).
+
+        An "outdoor_weather_entity" in the config entry is tried first, then
+        every other weather entity in id order. Returns (None, None, None)
+        when none has a temperature.
+        """
+        preferred = self.entry.data.get("outdoor_weather_entity")
+        states = list(self.hass.states.async_all("weather"))
+        states.sort(key=lambda st: (st.entity_id != preferred, st.entity_id))
+        for state in states:
+            if str(state.state).lower() in UNAVAILABLE_STATES:
+                continue
+            try:
+                temp = float(state.attributes.get("temperature"))
+            except (TypeError, ValueError):
+                continue
+            unit = str(state.attributes.get("temperature_unit") or "")
+            if unit.upper().endswith("C"):
+                temp = round(temp * 9.0 / 5.0 + 32.0, 1)
+            humidity = state.attributes.get("humidity")
+            try:
+                humidity = float(humidity) if humidity is not None else None
+            except (TypeError, ValueError):
+                humidity = None
+            return temp, humidity, state.entity_id
+        return None, None, None
+
+    def _last_known_outdoor(self):
+        """Most recent recorded outdoor sample if it is fresh enough."""
+        if not self._outdoor_samples:
+            return None, None
+        when, temp = self._outdoor_samples[-1]
+        age = datetime.now() - when
+        if age > timedelta(hours=OUTDOOR_LAST_KNOWN_MAX_HOURS):
+            return None, None
+        return temp, age
+
+    def _resolve_outdoor(self):
+        """Outdoor conditions as (temp_f, humidity, source, live).
+
+        Order: configured sensors, then any working weather entity, then a
+        recent remembered reading. temp_f is None when nothing is usable.
+        live is False for a remembered reading (it is not re-recorded).
+        """
+        sensor = self.entry.data.get("outdoor_temp_sensor", "sensor.outdoor_temperature")
+        humidity_sensor = self.entry.data.get("outdoor_humidity_sensor", "")
+        temp = self._state_float(sensor)
+        humidity = self._state_float(humidity_sensor)
+        source = sensor
+        live = True
+
+        if temp is None or humidity is None:
+            w_temp, w_humidity, w_entity = self._weather_fallback()
+            if temp is None and w_temp is not None:
+                temp, source = w_temp, w_entity
+            if humidity is None and w_humidity is not None:
+                humidity = w_humidity
+
+        if temp is None:
+            last, age = self._last_known_outdoor()
+            if last is not None:
+                temp = last
+                live = False
+                source = f"last known reading ({int(age.total_seconds() // 60)} min old)"
+            else:
+                source = None
+        return temp, humidity, source, live
+
+    @callback
+    def cancel_missing_retry(self) -> None:
+        """Cancel a pending missing-thermostat retry (used on unload)."""
+        if self._missing_retry_unsub is not None:
+            self._missing_retry_unsub()
+            self._missing_retry_unsub = None
+
+    def _schedule_missing_retry(self, missing: list) -> None:
+        """Re-run the check soon when configured thermostats are not loaded."""
+        if not missing:
+            self._missing_retries = 0
+            self.cancel_missing_retry()
+            return
+        if self._missing_retry_unsub is not None:
+            return
+        if self._missing_retries >= MISSING_THERMOSTAT_MAX_RETRIES:
+            if self._missing_retries == MISSING_THERMOSTAT_MAX_RETRIES:
+                _LOGGER.warning(
+                    "SOPHIA Climate: thermostat(s) %s still not available after %d "
+                    "retries; waiting for the regular check",
+                    ", ".join(missing), MISSING_THERMOSTAT_MAX_RETRIES,
+                )
+                self._missing_retries += 1
+            return
+        self._missing_retries += 1
+
+        @callback
+        def _retry(_now) -> None:
+            self._missing_retry_unsub = None
+            self.hass.async_create_task(self.async_refresh())
+
+        self._missing_retry_unsub = async_call_later(
+            self.hass, MISSING_THERMOSTAT_RETRY_SECONDS, _retry
+        )
+
+    async def _set_fan_mode_best_effort(self, thermostat_entity: str, fan_mode: str) -> bool:
+        """Set the fan mode without letting a refusal fail the HVAC change.
+
+        Skips the call when the fan is already in that mode or the thermostat
+        does not offer it. Some thermostats (Nest) refuse any fan command
+        while HVAC is off; that is logged as a warning, not an error.
+        """
+        state = self.hass.states.get(thermostat_entity)
+        attrs = state.attributes if state else {}
+        if attrs.get("fan_mode") == fan_mode:
+            return True
+        fan_modes = attrs.get("fan_modes")
+        if fan_modes is not None and fan_mode not in fan_modes:
+            _LOGGER.debug(
+                "%s does not offer fan mode %s (offers %s); skipping",
+                thermostat_entity, fan_mode, fan_modes,
+            )
+            return False
+        try:
+            await self.hass.services.async_call(
+                "climate",
+                "set_fan_mode",
+                {"entity_id": thermostat_entity, "fan_mode": fan_mode},
+                blocking=True,
+            )
+            return True
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "%s refused fan mode %s: %s", thermostat_entity, fan_mode, err
+            )
+            return False
+
+    def _report_outdoor_source(self, source) -> None:
+        """Log when the outdoor source changes, not on every check."""
+        configured = self.entry.data.get("outdoor_temp_sensor", "sensor.outdoor_temperature")
+        key = source or "none"
+        if key == self._outdoor_source_reported:
+            return
+        self._outdoor_source_reported = key
+        if source == configured:
+            _LOGGER.info("SOPHIA Climate: outdoor temperature from %s", source)
+        elif source:
+            _LOGGER.warning(
+                "SOPHIA Climate: outdoor sensor %s has no reading; using %s instead",
+                configured, source,
+            )
+        else:
+            _LOGGER.warning(
+                "SOPHIA Climate: no outdoor temperature from %s, any weather entity, "
+                "or a reading in the last %d hours; thermostats are left unchanged "
+                "until one is available",
+                configured, OUTDOOR_LAST_KNOWN_MAX_HOURS,
+            )
+
+    def _determine_regime(self, season: str, outdoor_temp: float) -> str:
+        """Decide which direction of conditioning is physically sensible now.
+
+        This exists because a target that steps UP (for example the 6 AM move
+        from the sleep target to the daytime target) makes the house read as
+        "too cold" even in the middle of August. Without a regime lock, the
+        only correct-looking action is HEAT, and the furnace fires to close a
+        gap that the sun would have closed for free.
+
+        Calendar season alone is not enough - a September morning in the
+        Southeast is still full cooling weather but classifies as fall. The
+        recent outdoor high is the honest signal.
+        """
+        cooling_high = self.entry.data.get(
+            "regime_cooling_recent_high", REGIME_COOLING_RECENT_HIGH
+        )
+        heating_high = self.entry.data.get(
+            "regime_heating_recent_high", REGIME_HEATING_RECENT_HIGH
+        )
+        outdoor_floor = self.entry.data.get(
+            "regime_outdoor_floor", REGIME_OUTDOOR_FLOOR
+        )
+
+        recent_high = self._recent_outdoor_high()
+
+        if recent_high is None:
+            # No trend data at all - fall back to the calendar, which is still
+            # right at the extremes even if it is wrong in the shoulders.
+            if season == SEASON_SUMMER:
+                return REGIME_COOLING
+            if season == SEASON_WINTER:
+                return REGIME_HEATING
+            return REGIME_NEUTRAL
+
+        if recent_high >= cooling_high and (
+            season == SEASON_SUMMER or outdoor_temp >= outdoor_floor
+        ):
+            return REGIME_COOLING
+
+        if recent_high <= heating_high:
+            return REGIME_HEATING
+
+        return REGIME_NEUTRAL
+
     async def _async_update_data(self):
         """Fetch data from API endpoint"""
-        
+        if self._check_in_progress:
+            _LOGGER.debug("Climate check already in progress, skipping duplicate trigger")
+            return self.data
+
+        self._check_in_progress = True
+        try:
+            return await self._run_climate_check()
+        finally:
+            self._check_in_progress = False
+
+    async def _run_climate_check(self):
+        """Execute the climate check logic."""
         _LOGGER.info("Running SOPHIA climate check...")
         
         # Determine season and time
@@ -577,6 +1030,10 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
         
         # Get current state for all zones
         zones_data = {}
+        missing_thermostats = []
+        previous_zones = (self.data or {}).get("zones", {}) if isinstance(self.data, dict) else {}
+        carried_zones = {}
+        starting = self.hass.state is not CoreState.running
         
         zones_list = self.entry.data.get("zones", [])
         
@@ -598,50 +1055,109 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
             state = self.hass.states.get(thermostat_entity)
             
             if not state:
-                _LOGGER.warning(f"Thermostat not found: {thermostat_entity}")
+                missing_thermostats.append(thermostat_entity)
+                if starting:
+                    _LOGGER.info(
+                        "Waiting for thermostat %s to load (zone %s)", thermostat_entity, zone_id
+                    )
+                else:
+                    _LOGGER.warning(f"Thermostat not found: {thermostat_entity}")
+                # Keep showing the last known readings; no decision is made.
+                if zone_id in previous_zones:
+                    carried_zones[zone_id] = dict(previous_zones[zone_id], stale=True)
                 continue
-            
-            # Prefer temp sensor reading if available
-            if temp_sensor_entity:
-                temp_state = self.hass.states.get(temp_sensor_entity)
-                indoor_temp = float(temp_state.state) if temp_state else state.attributes.get("current_temperature")
-            else:
-                indoor_temp = state.attributes.get("current_temperature")
+
+            if str(state.state).lower() in UNAVAILABLE_STATES:
+                _LOGGER.warning(
+                    "Thermostat %s for zone %s is %s; skipping zone this cycle",
+                    thermostat_entity, zone_id, state.state,
+                )
+                continue
+
+            # Prefer the zone temp sensor; fall back to the thermostat's own
+            # reading when the sensor is missing or has no number.
+            indoor_temp = self._state_float(temp_sensor_entity)
+            if indoor_temp is None:
+                try:
+                    current = state.attributes.get("current_temperature")
+                    indoor_temp = float(current) if current is not None else None
+                except (TypeError, ValueError):
+                    indoor_temp = None
+            if indoor_temp is None:
+                _LOGGER.warning(
+                    "No indoor temperature for zone %s (sensor %s, thermostat %s); "
+                    "skipping zone this cycle",
+                    zone_id, temp_sensor_entity, thermostat_entity,
+                )
+                continue
             
             # Get thermostat's ACTUAL current setpoint (what it's set to)
             # This is what we should compare against for efficiency, NOT SOPHIA's config
             thermostat_setpoint = state.attributes.get("temperature")
-            
+
+            # Each zone uses ITS OWN comfort target and prompt settings.
+            zone_target = self._get_zone_target_temp(zone, season, is_sleep)
+            if isinstance(zone, dict):
+                zone_energy_priority = zone.get("energy_priority", "balanced")
+                zone_aggressive = zone.get("aggressive_optimization", False)
+                zone_special = zone.get("special_instructions", "")
+                zone_priority = zone.get("priority", 5)
+            else:
+                zone_energy_priority = self.entry.data.get("energy_priority", "balanced")
+                zone_aggressive = self.entry.data.get("aggressive_optimization", False)
+                zone_special = self.entry.data.get("special_instructions", "")
+                zone_priority = 5
+
             zones_data[zone_id] = {
                 "indoor_temp": indoor_temp,
                 "target_temp": thermostat_setpoint,  # Use ACTUAL setpoint, not config
-                "sophia_target": target_temp,  # Store SOPHIA's config separately for AI
+                "sophia_target": zone_target,  # This zone's own target for the AI
                 "hvac_mode": state.state,
                 "hvac_action": state.attributes.get("hvac_action"),
-                "thermostat_entity": thermostat_entity
+                "thermostat_entity": thermostat_entity,
+                "temp_sensor": temp_sensor_entity,
+                "priority": zone_priority,
+                "energy_priority": zone_energy_priority,
+                "aggressive_optimization": zone_aggressive,
+                "special_instructions": zone_special,
             }
         
-        # Get outdoor temperature
-        outdoor_sensor = self.entry.data.get("outdoor_temp_sensor", "sensor.outdoor_temperature")
-        outdoor_state = self.hass.states.get(outdoor_sensor)
-        outdoor_temp = float(outdoor_state.state) if outdoor_state else 50.0
+        # Outdoor conditions: configured sensors, then any working weather
+        # entity, then a recent remembered reading. With none of those the
+        # check still completes but leaves every thermostat alone: guessing an
+        # outdoor temperature could pick the wrong heating/cooling regime.
+        await self._seed_outdoor_trend()
+        outdoor_temp, outdoor_humidity, outdoor_source, outdoor_live = self._resolve_outdoor()
+        self._report_outdoor_source(outdoor_source)
 
-        # Get outdoor humidity (None = unavailable, treated as unknown)
-        outdoor_humidity = None
-        humidity_sensor = self.entry.data.get("outdoor_humidity_sensor", "")
-        if humidity_sensor:
-            humidity_state = self.hass.states.get(humidity_sensor)
-            if humidity_state and humidity_state.state not in ("unavailable", "unknown", ""):
-                try:
-                    outdoor_humidity = float(humidity_state.state)
-                except ValueError:
-                    pass
+        skip_reason = None
+        if outdoor_temp is None:
+            skip_reason = "No outdoor temperature available - thermostat left unchanged"
+            regime = None
+        else:
+            if outdoor_live:
+                self._record_outdoor(outdoor_temp)
+            # Determine which direction of conditioning is sensible right now.
+            # This gates HEAT/COOL below so a target step-up in cooling weather
+            # can never fire the furnace.
+            regime = self._determine_regime(season, outdoor_temp)
+        recent_high = self._recent_outdoor_high()
+        _LOGGER.debug(
+            "SOPHIA Climate regime=%s (season=%s, outdoor=%sF from %s, recent 24h high=%s)",
+            regime, season, outdoor_temp, outdoor_source, recent_high,
+        )
 
         # Make AI decision for each zone
         decisions = {}
 
         for zone_id, zone_data in zones_data.items():
-            prompt = self._build_climate_prompt(zone_id, zone_data, outdoor_temp, outdoor_humidity, season, is_sleep)
+            zone_data["hvac_regime"] = regime
+            if skip_reason:
+                decisions[zone_id] = {"decision": "NO_CHANGE", "reasoning": skip_reason}
+                continue
+            prompt = self._build_climate_prompt(
+                zone_id, zone_data, outdoor_temp, outdoor_humidity, season, is_sleep, regime
+            )
             
             llm_response = await self.llm_client.generate(
                 prompt=prompt,
@@ -663,6 +1179,8 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
                     "target_temp": zone_data.get("sophia_target"),
                     "outdoor_temp": outdoor_temp,
                     "season": season,
+                    "hvac_regime": regime,
+                    "recent_outdoor_high": recent_high,
                     "is_sleep_time": is_sleep,
                     "hvac_mode": zone_data.get("hvac_mode"),
                     "hvac_action": zone_data.get("hvac_action"),
@@ -684,21 +1202,28 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning(f"Failed to cache stats: {e}")
             self._cached_stats = {}
         
+        self._schedule_missing_retry(missing_thermostats)
+
         return {
-            "zones": zones_data,
+            "zones": {**carried_zones, **zones_data},
+            "missing_thermostats": missing_thermostats,
             "outdoor_temp": outdoor_temp,
+            "outdoor_humidity": outdoor_humidity,
+            "outdoor_source": outdoor_source,
             "season": season,
+            "hvac_regime": regime,
+            "recent_outdoor_high": recent_high,
             "is_sleep_time": is_sleep,
             "decisions": decisions,
             "timestamp": datetime.now().isoformat()
         }
     
-    def _build_climate_prompt(self, zone_id: str, zone_data: dict, outdoor_temp: float, outdoor_humidity, season: str, is_sleep: bool) -> str:
+    def _build_climate_prompt(self, zone_id: str, zone_data: dict, outdoor_temp: float, outdoor_humidity, season: str, is_sleep: bool, regime: str = REGIME_NEUTRAL) -> str:
         """Build prompt for LLM climate decision"""
 
-        energy_priority = self.entry.data.get("energy_priority", "balanced")
-        special_instructions = self.entry.data.get("special_instructions", "")
-        aggressive_optimization = self.entry.data.get("aggressive_optimization", False)
+        energy_priority = zone_data.get("energy_priority", self.entry.data.get("energy_priority", "balanced"))
+        special_instructions = zone_data.get("special_instructions", self.entry.data.get("special_instructions", ""))
+        aggressive_optimization = zone_data.get("aggressive_optimization", self.entry.data.get("aggressive_optimization", False))
         passive_humidity_limit = self.entry.data.get("passive_humidity_limit", 60)
         
         # Define tolerance thresholds based on energy priority and aggressive mode
@@ -723,9 +1248,12 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
         current_hvac_mode = zone_data['hvac_mode']
         current_hvac_action = zone_data['hvac_action']
         
-        # Determine season type for sleep logic
-        heating_season = season in ["winter", "fall"]
-        cooling_season = season in ["summer", "spring"]
+        # Which directions of conditioning are permitted right now.
+        # Derived from actual weather, not the calendar - a September morning
+        # in the Southeast is fall by the calendar and cooling weather in fact.
+        heat_allowed = regime != REGIME_COOLING
+        cool_allowed = regime != REGIME_HEATING
+        heating_regime = regime == REGIME_HEATING
         shoulder_season = 65 <= outdoor_temp <= 75
         
         # Passive cooling is possible when outdoor air can do the job for free.
@@ -753,20 +1281,31 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
         
         # PRE-COMPUTE the situation so Mistral doesn't have to evaluate conditionals.
         # This is the single source of truth - the LLM just writes the explanation.
-        if is_sleep and heating_season and indoor_temp > sophia_target + 1:
+        if is_sleep and heating_regime and indoor_temp > sophia_target + 1:
             situation = "SLEEP_DRIFT_DOWN"
             recommended = "OFF"
             situation_summary = (
-                f"Sleep time in {season}. Indoor ({indoor_temp}F) is above sleep target ({sophia_target}F). "
+                f"Sleep time in heating weather ({season}). Indoor ({indoor_temp}F) is above sleep target ({sophia_target}F). "
                 f"Turning OFF - temperature will drift down naturally. "
-                f"Running AC in {season} to cool would waste energy."
+                f"Running AC in heating weather to cool would waste energy."
             )
-        elif is_sleep and heating_season and indoor_temp < sophia_target:
+        elif is_sleep and heating_regime and indoor_temp < sophia_target:
             situation = "SLEEP_TOO_COLD"
             recommended = f"HEAT_{int(sophia_target)}"
             situation_summary = (
-                f"Sleep time in {season}. Indoor ({indoor_temp}F) has dropped below sleep target ({sophia_target}F). "
+                f"Sleep time in heating weather ({season}). Indoor ({indoor_temp}F) has dropped below sleep target ({sophia_target}F). "
                 f"Heating to prevent it getting too cold overnight."
+            )
+        elif temp_delta > tolerance and not cool_allowed:
+            # Warm side of target, but we are in heating weather. Running the
+            # AC to shave a couple of degrees off in winter wastes energy -
+            # turn off and let the house drift down on its own.
+            situation = "HEATING_WEATHER_ABOVE_TARGET"
+            recommended = "OFF"
+            situation_summary = (
+                f"Indoor ({indoor_temp}F) is {temp_delta:+.1f}F above target ({sophia_target}F), "
+                f"but the recent outdoor high says this is heating weather. "
+                f"Turning OFF so the temperature drifts down naturally instead of running the AC."
             )
         elif temp_delta > tolerance:
             # Too warm - need to lower temperature
@@ -793,6 +1332,28 @@ class SophiaClimateCoordinator(DataUpdateCoordinator):
                 situation_summary = (
                     f"Indoor ({indoor_temp}F) is {temp_delta:+.1f}F above target ({sophia_target}F). "
                     f"{passive_note} Switching to COOL mode."
+                )
+        elif temp_delta < -tolerance and not heat_allowed:
+            # Below target in cooling weather. This is the 6 AM case: the
+            # target steps up from the sleep value to the daytime value and
+            # the house suddenly reads "too cold" in August. The house will
+            # warm itself for free - the only thing to do is stop cooling to
+            # the old, lower setpoint. Never fire the furnace here.
+            situation = "COOLING_WEATHER_BELOW_TARGET"
+            if current_hvac_mode == "cool" and thermostat_setpoint == sophia_target:
+                recommended = "NO_CHANGE"
+                situation_summary = (
+                    f"Indoor ({indoor_temp}F) is {temp_delta:+.1f}F below target ({sophia_target}F) in cooling weather. "
+                    f"Thermostat is already parked at {sophia_target}F and idle - the house will warm up on its own. "
+                    f"Heating is not appropriate in cooling weather."
+                )
+            else:
+                recommended = f"COOL_{int(sophia_target)}"
+                situation_summary = (
+                    f"Indoor ({indoor_temp}F) is {temp_delta:+.1f}F below target ({sophia_target}F) in cooling weather. "
+                    f"This is a target change, not a cold house. Parking the thermostat in COOL at {sophia_target}F "
+                    f"so it stops cooling to the old setpoint and idles while the house drifts up naturally. "
+                    f"Heating is not appropriate in cooling weather."
                 )
         elif temp_delta < -tolerance:
             # Too cold - HEAT is the only correct physical action
@@ -833,6 +1394,7 @@ SITUATION (pre-analyzed by SOPHIA):
 - HVAC Mode: {current_hvac_mode} | HVAC Action: {current_hvac_action}
 - Thermostat Set To: {thermostat_setpoint}F | Tolerance: +/-{tolerance}F
 - Passive cooling available: {passive_cooling_available} ({passive_note})
+- HVAC regime: {regime} (heating allowed: {heat_allowed}, cooling allowed: {cool_allowed})
 - Situation: {situation}
 
 SOPHIA's ANALYSIS: {situation_summary}
@@ -892,20 +1454,63 @@ Respond with JSON only:
             
             temp_delta = indoor_temp - sophia_target  # positive = too warm
             
-            energy_priority = self.entry.data.get("energy_priority", "balanced")
-            aggressive = self.entry.data.get("aggressive_optimization", False)
+            energy_priority = zone_data.get("energy_priority", self.entry.data.get("energy_priority", "balanced"))
+            aggressive = zone_data.get(
+                "aggressive_optimization",
+                self.entry.data.get("aggressive_optimization", False),
+            )
             tolerance_map = {"comfort": 0.5 if aggressive else 1.0,
                              "balanced": 1.0 if aggressive else 2.0,
                              "savings": 2.0 if aggressive else 3.0}
             tolerance = tolerance_map.get(energy_priority, 2.0)
-            
+
+            regime = zone_data.get("hvac_regime", REGIME_NEUTRAL)
+            thermostat = zone_data.get("thermostat_entity", "unknown")
+
+            # REGIME LOCKOUT - runs before the physics checks below.
+            # In cooling weather the furnace never runs to close a comfort
+            # gap, no matter what the LLM asks for. Being below target in
+            # August means the target moved, not that the house is cold.
+            if action == "HEAT" and regime == REGIME_COOLING:
+                _LOGGER.warning(
+                    "[SOPHIA REGIME LOCKOUT] %s: LLM requested %s but recent outdoor "
+                    "highs put us in cooling weather. Heating is locked out. "
+                    "Indoor %sF, target %sF.",
+                    thermostat, decision_str, indoor_temp, sophia_target,
+                )
+                return {
+                    "decision": f"COOL_{int(sophia_target)}",
+                    "reasoning": (
+                        f"[Regime lockout] Heating is not appropriate in cooling weather. "
+                        f"Indoor {indoor_temp}F is below target {sophia_target}F because the target "
+                        f"changed, not because the house is cold. Parking the thermostat in COOL at "
+                        f"{sophia_target}F so it idles and the house warms up on its own."
+                    )
+                }
+
+            if action == "COOL" and regime == REGIME_HEATING:
+                _LOGGER.warning(
+                    "[SOPHIA REGIME LOCKOUT] %s: LLM requested %s but recent outdoor "
+                    "highs put us in heating weather. Cooling is locked out. "
+                    "Indoor %sF, target %sF.",
+                    thermostat, decision_str, indoor_temp, sophia_target,
+                )
+                return {
+                    "decision": "OFF",
+                    "reasoning": (
+                        f"[Regime lockout] Running the AC is not appropriate in heating weather. "
+                        f"Indoor {indoor_temp}F versus target {sophia_target}F - turning OFF so the "
+                        f"temperature drifts down naturally instead."
+                    )
+                }
+
             # HEAT when already too warm - physically impossible, override
             if action == "HEAT" and temp_delta > 0:
                 original = decision_str
                 if temp_delta > tolerance:
                     corrected = f"COOL_{int(sophia_target)}"
                     _LOGGER.warning(
-                        f"[SOPHIA SAFETY OVERRIDE] {zone_id if (zone_id := zone_data.get('thermostat_entity', 'unknown')) else 'unknown'}: "
+                        f"[SOPHIA SAFETY OVERRIDE] {thermostat}: "
                         f"LLM requested {original} but indoor ({indoor_temp}F) is {temp_delta:+.1f}F "
                         f"ABOVE target ({sophia_target}F). HEAT would make it worse. Correcting to {corrected}."
                     )
@@ -931,9 +1536,38 @@ Respond with JSON only:
                         )
                     }
             
-            # COOL when already too cold - physically wasteful, override
+            # COOL when already too cold - physically wasteful, override.
+            # In cooling weather this is legitimate: parking the thermostat in
+            # COOL at the new target is how we stop it cooling to the old,
+            # lower setpoint. Only flip to HEAT when heating is permitted.
             if action == "COOL" and temp_delta < 0:
                 original = decision_str
+                if abs(temp_delta) > tolerance and regime == REGIME_COOLING:
+                    already_parked = (
+                        zone_data.get("target_temp") == sophia_target
+                        and zone_data.get("hvac_mode") == "cool"
+                    )
+                    if already_parked:
+                        _LOGGER.debug(
+                            "Thermostat already parked at %sF in cool - no change needed",
+                            sophia_target,
+                        )
+                        return {
+                            "decision": "NO_CHANGE",
+                            "reasoning": (
+                                f"Indoor {indoor_temp}F is below target {sophia_target}F in cooling "
+                                f"weather. Thermostat is already parked at {sophia_target}F and idle - "
+                                f"the house will warm up on its own."
+                            )
+                        }
+                    return {
+                        "decision": f"COOL_{int(sophia_target)}",
+                        "reasoning": (
+                            f"Indoor {indoor_temp}F is below target {sophia_target}F in cooling weather. "
+                            f"Parking the thermostat in COOL at {sophia_target}F so it idles until the "
+                            f"house drifts up. Heating is not appropriate in cooling weather."
+                        )
+                    }
                 if abs(temp_delta) > tolerance:
                     corrected = f"HEAT_{int(sophia_target)}"
                     _LOGGER.warning(
@@ -1008,18 +1642,13 @@ Respond with JSON only:
                     blocking=True
                 )
                 
-                # Turn off fan
-                await self.hass.services.async_call(
-                    "climate",
-                    "set_fan_mode",
-                    {
-                        "entity_id": thermostat_entity,
-                        "fan_mode": "off",
-                    },
-                    blocking=True
+                # Turn off fan (skipped when it already stopped with the HVAC)
+                fan_ok = await self._set_fan_mode_best_effort(thermostat_entity, "off")
+
+                _LOGGER.info(
+                    "Successfully turned off %s (HVAC%s)",
+                    thermostat_entity, " + fan" if fan_ok else "; fan left as is",
                 )
-                
-                _LOGGER.info(f"Successfully turned off {thermostat_entity} (HVAC + fan)")
                 return
                 
             except Exception as e:
@@ -1047,18 +1676,19 @@ Respond with JSON only:
                     blocking=True
                 )
                 
-                # Turn on fan for circulation
-                await self.hass.services.async_call(
-                    "climate",
-                    "set_fan_mode",
-                    {
-                        "entity_id": thermostat_entity,
-                        "fan_mode": "on",
-                    },
-                    blocking=True
-                )
-                
-                _LOGGER.info(f"Successfully set {thermostat_entity} to circulation mode (HVAC off, fan on)")
+                # Turn on fan for circulation. Some thermostats (Nest) do not
+                # allow the fan to run while HVAC is off; HVAC stays off then.
+                if await self._set_fan_mode_best_effort(thermostat_entity, "on"):
+                    _LOGGER.info(
+                        "Successfully set %s to circulation mode (HVAC off, fan on)",
+                        thermostat_entity,
+                    )
+                else:
+                    _LOGGER.info(
+                        "Set %s HVAC off; the thermostat would not run the fan "
+                        "for circulation",
+                        thermostat_entity,
+                    )
                 return
                 
             except Exception as e:
@@ -1096,15 +1726,7 @@ Respond with JSON only:
             )
             
             # Set fan to auto (off) when heating/cooling
-            await self.hass.services.async_call(
-                "climate",
-                "set_fan_mode",
-                {
-                    "entity_id": thermostat_entity,
-                    "fan_mode": "off",  # Auto mode - runs with HVAC
-                },
-                blocking=True
-            )
+            await self._set_fan_mode_best_effort(thermostat_entity, "off")
             
             _LOGGER.info(f"Successfully set {thermostat_entity} to {action} at {target_temp} degrees F with auto fan")
             
